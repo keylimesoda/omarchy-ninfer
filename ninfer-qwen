@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+container=ninfer-qwen
+api=http://127.0.0.1:8080
+action=${1:-status}
+
+# Serving configuration, kept in sync with the launch arguments below.
+model_id_fallback=qwen3.8-27b
+model_name_fallback="Qwen 3.8 27B"
+context_window_fallback=262144
+kv_dtype=rk4v4-e8
+spec=mtp
+draft_tokens=3
+image=ninfer-4090:sm89
+# Vision is opt-in: the persisted flag decides whether start_model passes --vision.
+vision_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ninfer-qwen"
+vision_file="$vision_dir/vision"
+
+read_vision() {
+  if [[ -f "$vision_file" ]] && grep -qx on "$vision_file" 2>/dev/null; then
+    printf 'on\n'
+  else
+    printf 'off\n'
+  fi
+}
+
+set_vision() {
+  mkdir -p "$vision_dir"
+  printf '%s\n' "$1" >"$vision_file"
+}
+
+exists() {
+  docker container inspect "$container" >/dev/null 2>&1
+}
+
+running() {
+  [[ $(docker container inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true) == true ]]
+}
+
+start_model() {
+  local vision_args=()
+  [[ "$(read_vision)" == on ]] && vision_args=(--vision)
+  if exists; then
+    if ! running; then docker start "$container" >/dev/null; fi
+  else
+    docker run --detach --restart unless-stopped --gpus all --name "$container" \
+      --publish 127.0.0.1:8080:8080 \
+      --volume ninfer-continuations:/var/cache/ninfer \
+      ninfer-4090:sm89 \
+      ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
+      --model-id qwen3.8-27b \
+      --host 0.0.0.0 --port 8080 \
+      --max-context 262144 --kv-capacity 262144 \
+      --max-concurrency 1 --max-pending-requests 16 \
+      --pending-timeout-ms 600000 --prefill-chunk 1024 \
+      --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 3 --lm-head-draft \
+      --prefix-checkpoint-policy rolling-tool \
+      --continuation-cache l1-l2-l3 \
+      --continuation-cache-dir /var/cache/ninfer \
+      --continuation-cache-namespace local \
+      --continuation-cache-l1-mib 768 \
+      --continuation-cache-l2-mib 16384 \
+      --continuation-cache-l3-mib 49152 \
+      --continuation-cache-filesystem-reserve-mib 4096 \
+      --preserve-thinking \
+      --no-cuda-graph "${vision_args[@]}" >/dev/null
+  fi
+}
+
+stop_model() {
+  if exists && running; then docker stop --time 30 "$container" >/dev/null; fi
+}
+
+# Launch arguments are baked into the container, so a config change needs a
+# full recreate rather than docker start.
+recreate_model() {
+  if exists; then
+    docker stop --time 30 "$container" >/dev/null
+    docker rm "$container" >/dev/null 2>&1
+  fi
+  start_model
+}
+
+vision_cmd() {
+  local want="${1:-toggle}"
+  if [[ "$want" != on && "$want" != off ]]; then
+    if [[ "$(read_vision)" == on ]]; then want=off; else want=on; fi
+  fi
+  set_vision "$want"
+  if exists && running; then
+    recreate_model
+    printf 'restarting\n'
+  else
+    printf '%s\n' "$want"
+  fi
+}
+
+status() {
+  if ! exists; then
+    printf 'off\n'
+    return
+  fi
+  if ! running; then
+    local ec
+    ec=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null || printf '0')
+    if [[ "$ec" =~ ^[0-9]+$ ]] && (( ec != 0 )); then
+      printf 'failed\n'
+    else
+      printf 'off\n'
+    fi
+    return
+  fi
+  if curl --silent --fail --max-time 3 "$api/v1/models" >/dev/null 2>&1; then
+    printf 'ready\n'
+  else
+    printf 'starting\n'
+  fi
+}
+
+# metric METRICS_TEXT NAME -> value (empty when absent)
+metric() {
+  printf '%s\n' "$1" | awk -v k="$2" '$1 == k { v = $2 } END { if (v != "") print v }'
+}
+
+info() {
+  local state
+  state=$(status)
+  printf 'state=%s\n' "$state"
+
+  # Model facts: static serving config, overridden by the live API when up.
+  local model_id= model_ctx= vision=
+  if [[ "$state" == "ready" ]]; then
+    local models parsed
+    models=$(curl -s --max-time 3 "$api/v1/models" 2>/dev/null || true)
+    if [[ -n "$models" ]]; then
+      parsed=$(printf '%s' "$models" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)["data"][0]
+    m = d.get("modalities") or {}
+    print(d.get("id", ""), d.get("context_window", ""), "on" if m.get("vision") else "off")
+except Exception:
+    pass' 2>/dev/null || true)
+      if [[ -n "$parsed" ]]; then
+        read -r model_id model_ctx vision <<<"$parsed"
+      fi
+    fi
+  fi
+  [[ -n "$vision" ]] || vision=$(read_vision)
+
+  printf 'model_id=%s\n' "${model_id:-$model_id_fallback}"
+  printf 'model_name=%s\n' "$model_name_fallback"
+  printf 'context_window=%s\n' "${model_ctx:-$context_window_fallback}"
+  printf 'kv_dtype=%s\n' "$kv_dtype"
+  printf 'spec=%s\n' "$spec"
+  printf 'draft_tokens=%s\n' "$draft_tokens"
+  printf 'vision=%s\n' "$vision"
+  printf 'endpoint=127.0.0.1:8080\n'
+  printf 'image=%s\n' "$image"
+
+  # GPU facts; degrades gracefully when nvidia-smi is unavailable.
+  local gpu_line= gname= gused= gtotal= gpower=
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_line=$(nvidia-smi --query-gpu=name,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 || true)
+  fi
+  # nvidia-smi CSV puts a space after each comma; trim fields afterwards.
+if [[ -n "$gpu_line" && "$gpu_line" =~ ^[^,]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9.]+$ ]]; then
+    IFS=',' read -r gname gused gtotal gpower <<<"$gpu_line"
+    gused=${gused// /}; gtotal=${gtotal// /}; gpower=${gpower// /}
+    gname=${gname#NVIDIA }
+    gname=${gname#GeForce }
+  fi
+  printf 'gpu_name=%s\n' "${gname:-GPU}"
+  printf 'vram_used=%s\n' "${gused:-0}"
+  printf 'vram_total=%s\n' "${gtotal:-0}"
+  printf 'power_watts=%s\n' "${gpower:-0}"
+
+  if [[ "$state" == "ready" || "$state" == "starting" ]]; then
+    local started_at= epoch=0
+    started_at=$(docker inspect --format '{{.State.StartedAt}}' "$container" 2>/dev/null || true)
+    if [[ -n "$started_at" ]]; then
+      epoch=$(date -d "$started_at" +%s 2>/dev/null || printf '0')
+    fi
+    printf 'epoch=%s\n' "$epoch"
+
+    if [[ "$state" == "ready" ]]; then
+      local metrics
+      metrics=$(curl -s --max-time 5 "$api/metrics" 2>/dev/null || true)
+      printf 'prompt_tokens=%s\n'    "$(metric "$metrics" llamacpp:prompt_tokens_total)"
+      printf 'prompt_seconds=%s\n'   "$(metric "$metrics" llamacpp:prompt_seconds_total)"
+      printf 'predicted_tokens=%s\n' "$(metric "$metrics" llamacpp:tokens_predicted_total)"
+      printf 'predicted_seconds=%s\n' "$(metric "$metrics" llamacpp:tokens_predicted_seconds_total)"
+      printf 'requests_processing=%s\n'  "$(metric "$metrics" llamacpp:requests_processing)"
+      printf 'requests_deferred=%s\n'    "$(metric "$metrics" llamacpp:requests_deferred)"
+      printf 'requests_total=%s\n'       "$(metric "$metrics" ninfer:requests_total)"
+      printf 'prefix_hit_tokens=%s\n'    "$(metric "$metrics" ninfer:prefix_cache_hit_tokens_total)"
+      printf 'draft_total=%s\n'          "$(metric "$metrics" ninfer:draft_tokens_total)"
+      printf 'draft_accepted=%s\n'       "$(metric "$metrics" ninfer:draft_accepted_tokens_total)"
+      printf 'cont_restored_tokens=%s\n' "$(metric "$metrics" ninfer:continuation_restored_tokens_total)"
+      printf 'cont_l1_tokens=%s\n'       "$(metric "$metrics" ninfer:continuation_l1_restored_tokens_total)"
+      printf 'cont_l2_tokens=%s\n'       "$(metric "$metrics" ninfer:continuation_l2_restored_tokens_total)"
+      printf 'cont_l3_tokens=%s\n'       "$(metric "$metrics" ninfer:continuation_l3_restored_tokens_total)"
+    fi
+  fi
+}
+
+case "$action" in
+  on|enable|start)
+    start_model
+    printf 'starting\n'
+    ;;
+  off|disable|stop)
+    stop_model
+    printf 'off\n'
+    ;;
+  toggle)
+    if running; then
+      stop_model
+      printf 'off\n'
+    else
+      start_model
+      printf 'starting\n'
+    fi
+    ;;
+  status)
+    status
+    ;;
+  info)
+    info
+    ;;
+  vision)
+    vision_cmd "${2:-toggle}"
+    ;;
+  *)
+    printf 'Usage: ninfer-qwen {status|info|on|off|toggle|vision [on|off|toggle]}\n' >&2
+    exit 2
+    ;;
+esac

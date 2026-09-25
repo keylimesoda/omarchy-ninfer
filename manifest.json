@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "keylimesoda.ninfer",
+  "name": "NInfer Qwen",
+  "version": "1.0.0",
+  "author": "Ric Lewis",
+  "description": "Local Qwen 3.8 inference: on/off with a live status panel (model, throughput, GPU, caches) and a vision-input toggle",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "NInfer Qwen",
+    "description": "Start or stop local Qwen 3.8 27B inference",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

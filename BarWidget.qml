@@ -19,8 +19,8 @@ Panel {
   // directory (see `ninfer-qwen`); the knobs — container name, API endpoint,
   // model metadata — live at the top of that script.
   readonly property string bin: {
-    const p = Qt.resolvedUrl("ninfer-qwen")
-    return p.startsWith("file://") ? p.slice("file://".length) : p
+    const u = Qt.resolvedUrl("ninfer-qwen").toString()
+    return u.startsWith("file://") ? u.slice(7) : u
   }
   readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
   readonly property string ff: root.bar ? root.bar.fontFamily : Style.font.family

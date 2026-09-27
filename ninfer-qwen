@@ -5,6 +5,12 @@ container=ninfer-qwen
 api=http://127.0.0.1:8080
 action=${1:-status}
 
+# Telemetry assumes the HTTP API emitted by tensorninja/ninfer-4090
+# (github.com/tensorninja/ninfer-4090): the OpenAI-compatible /v1/models plus
+# the llama.cpp-compatible /metrics and that runtime's ninfer_* prefix,
+# draft, and continuation-cache counters. Other ninfer forks or upstream may
+# not emit those counters, in which case the matching panel fields read zero.
+
 # Serving configuration, kept in sync with the launch arguments below.
 model_id_fallback=qwen3.8-27b
 model_name_fallback="Qwen 3.8 27B"

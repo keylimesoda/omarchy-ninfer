@@ -54,14 +54,31 @@ omarchy plugin add https://github.com/keylimesoda/omarchy-ninfer.git --enable
 The widget lands in the right bar section (its manifest default). Update with
 `omarchy plugin update keylimesoda.ninfer`, remove with `omarchy plugin remove`.
 
+### Engine
+
+The helper drives one of two engines, both serving the API on `127.0.0.1:8080`:
+
+- **lovelace** (default) — [keylimesoda/lovelace](https://github.com/keylimesoda/lovelace)
+  via `$LOVELACE_DIR/deploy/serve.sh` (`LOVELACE_DIR` defaults to
+  `~/Work/lovelace`; containers `lovelace` + `lovelace-proxy`). The power
+  switch runs `serve.sh balanced` (or `serve.sh vision` with the vision
+  toggle on) and `serve.sh stop`; the DFlash2 switch is hidden.
+- **ninfer** — the `ninfer-qwen` container launched by the helper itself.
+
+Pick one with `ninfer-qwen engine lovelace|ninfer` (stored in
+`~/.config/ninfer-qwen/engine`; `NINFER_QWEN_ENGINE` overrides it). The helper
+refuses to start an engine while the other one's container is running.
+`ninfer-qwen restart` recreates the selected engine; `ninfer-qwen logs`
+follows its log.
+
 ## Requirements
 
 - Omarchy (this is a shell plugin; first-party plugins are not required)
 - Docker with NVIDIA GPU support, `nvidia-smi` on the host
-- The `ninfer-4090:sm89` image built from
-  [tensorninja/ninfer-4090](https://github.com/tensorninja/ninfer-4090)
-  (the panel's telemetry depends on that build's `/metrics` layout)
-- The model file at `/opt/ninfer/models/qwen3_8_27b.ninfer` inside the image
+- lovelace: a lovelace checkout with the `lovelace-serve:latest` image built
+  (see its `deploy/`)
+- ninfer: the `ninfer-4090:hybrid` image and the model artifact the helper
+  bind-mounts (`NINFER_MODEL_ARTIFACT`)
 - `curl` and `python3` on the host (used by the helper)
 
 ## Adapting it to your setup
@@ -72,11 +89,11 @@ RTX 4090 stack. The knobs live in the block at the top of the bundled
 
 | Variable | Meaning |
 |---|---|
-| `container` | Docker container name the helper manages |
+| `engine` / `container` | Engine selection and the Docker container it manages |
 | `api` | Base URL of the OpenAI-compatible endpoint (`/v1/models`, `/metrics`) |
 | `model_*_fallback` | Model facts used when the API is unreachable |
-| `kv_dtype` / `spec` / `draft_tokens` | Static labels shown in the panel |
-| `image` | Image name shown in the panel |
+| `kv_dtype` / `spec` / `draft_tokens` | Static ninfer labels (lovelace reads them from the container's args) |
+| `image` | ninfer image name shown in the panel |
 
 If your server's `docker run` line differs, adjust the `start_model` block in
 the helper; the panel's telemetry assumes the

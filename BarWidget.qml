@@ -43,6 +43,8 @@ Panel {
   readonly property bool busy: root.actionRunning
   readonly property bool visionOn: root.info.vision === "on"
   readonly property bool specOn: root.info.spec === "dflash2"
+  // DFlash2/MTP switching is a ninfer launch option; lovelace profiles pin MTP.
+  readonly property bool specAvailable: root.info.engine === "ninfer"
 
   readonly property color stateColor: root.on ? "#adda78"
     : root.failed ? Color.urgent
@@ -190,7 +192,7 @@ Panel {
 
   Process {
     id: logsProc
-    command: ["omarchy", "launch", "terminal", "docker", "logs", "--follow", "--tail", "200", "ninfer-qwen"]
+    command: ["omarchy", "launch", "terminal", root.bin, "logs"]
   }
 
   Process {
@@ -250,7 +252,7 @@ Panel {
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
-        const sections = ["hero", "spec", "vision", "actions"]
+        const sections = root.specAvailable ? ["hero", "spec", "vision", "actions"] : ["hero", "vision", "actions"]
         if (root.focusSection === "actions") {
           // Inside actions: horizontal picks dashboard/logs, vertical leaves.
           if (dx !== 0) {
@@ -463,10 +465,12 @@ Panel {
 
           // ---------- Spec decode ----------
           PanelSeparator {
+            visible: root.specAvailable
             foreground: root.fg
           }
 
           Column {
+            visible: root.specAvailable
             width: parent.width
             spacing: Style.space(8)
 

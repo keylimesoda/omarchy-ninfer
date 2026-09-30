@@ -1,5 +1,11 @@
 # omarchy-ninfer — NInfer Qwen status widget
 
+> **Moved.** This widget now lives in the lovelace repository as the lovelace desktop monitor:
+> [keylimesoda/lovelace/integrations/omarchy](https://github.com/keylimesoda/lovelace/tree/main/integrations/omarchy)
+> (plugin `keylimesoda.lovelace`, helper `lovelace-monitor`; the ninfer engine remains a fallback mode there).
+> Switch with `omarchy plugin remove keylimesoda.ninfer --yes`, then from a lovelace checkout
+> `integrations/omarchy/install.sh --enable --ninfer-qwen-alias`.
+
 A status-bar widget and drop-down panel for Omarchy that monitors and controls a
 **local [NInfer-4090](https://github.com/tensorninja/ninfer-4090) Qwen 3.8 27B
 inference server running in Docker** (RTX 4090 in the reference setup).

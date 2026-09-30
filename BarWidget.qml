@@ -42,6 +42,7 @@ Panel {
   readonly property bool serviceActive: root.on || root.starting
   readonly property bool busy: root.actionRunning
   readonly property bool visionOn: root.info.vision === "on"
+  readonly property bool specOn: root.info.spec === "dflash2"
 
   readonly property color stateColor: root.on ? "#adda78"
     : root.failed ? Color.urgent
@@ -59,11 +60,12 @@ Panel {
     return "Offline"
   }
 
-  readonly property var cacheParts: root.cachePartsValue()
-  function cachePartsValue() { return Model.cacheParts(root.info) }
+  readonly property real ctxFraction: Model.ctxDeviceFraction(root.info)
 
-  // Keyboard cursor targets: "hero" (power switch) | "vision" (input switch) | "actions" (logs)
+  // Keyboard cursor targets: "hero" (power switch) | "vision" (input switch) |
+  // "actions" (dashboard / logs buttons, selected by actionIndex)
   property string focusSection: "hero"
+  property int actionIndex: 0
   property bool cursorActive: false
 
   function pollStatus() { if (!statusProc.running) statusProc.running = true }
@@ -113,11 +115,23 @@ Panel {
     if (!logsProc.running) logsProc.running = true
   }
 
+  function openDashboard() {
+    if (!dashProc.running) dashProc.running = true
+  }
+
   function toggleVision() {
     if (root.actionRunning) return
     root.stateBeforeAction = root.serviceState
     root.actionRunning = true
     actionProc.command = [root.bin, "vision", "toggle"]
+    actionProc.running = true
+  }
+
+  function toggleSpec() {
+    if (root.actionRunning) return
+    root.stateBeforeAction = root.serviceState
+    root.actionRunning = true
+    actionProc.command = [root.bin, "spec", "toggle"]
     actionProc.running = true
   }
 
@@ -131,6 +145,7 @@ Panel {
     function toggle() { root.toggle() }
     function service() { root.toggleService() }
     function vision() { root.toggleVision() }
+    function spec() { root.toggleSpec() }
   }
 
   onOpenedChanged: {
@@ -138,6 +153,7 @@ Panel {
       root.refreshInfo()
       root.cursorActive = false
       root.focusSection = "hero"
+      root.actionIndex = 0
     }
   }
 
@@ -175,6 +191,11 @@ Panel {
   Process {
     id: logsProc
     command: ["omarchy", "launch", "terminal", "docker", "logs", "--follow", "--tail", "200", "ninfer-qwen"]
+  }
+
+  Process {
+    id: dashProc
+    command: ["omarchy", "launch", "browser", "http://127.0.0.1:8080/"]
   }
 
   Timer { interval: 5000; repeat: true; running: true; onTriggered: root.pollStatus() }
@@ -229,16 +250,30 @@ Panel {
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
+        const sections = ["hero", "spec", "vision", "actions"]
+        if (root.focusSection === "actions") {
+          // Inside actions: horizontal picks dashboard/logs, vertical leaves.
+          if (dx !== 0) {
+            root.actionIndex = dx > 0 ? 1 : 0
+            return
+          }
+          if (dy === 0) return
+          root.actionIndex = 0
+          root.focusSection = dy > 0 ? "hero" : "vision"
+          return
+        }
         const d = dy !== 0 ? dy : dx
         if (d === 0) return
-        const sections = ["hero", "vision", "actions"]
         const i = sections.indexOf(root.focusSection)
         root.focusSection = sections[(i + (d > 0 ? 1 : sections.length - 1)) % sections.length]
+        root.actionIndex = 0
       }
       onActivateRequested: {
         if (!root.cursorActive) return
         if (root.focusSection === "hero") root.toggleService()
+        else if (root.focusSection === "spec") root.toggleSpec()
         else if (root.focusSection === "vision") root.toggleVision()
+        else if (root.actionIndex === 0) root.openDashboard()
         else root.openLogs()
       }
       onCloseRequested: root.close()
@@ -393,14 +428,14 @@ Panel {
             visible: root.on
 
             PanelSectionHeader {
-              text: "CONTINUATION CACHE"
+              text: "CONTEXT CACHE"
               foreground: root.fg
               fontFamily: root.ff
             }
 
-            InfoPair { label: "Restored"; value: Model.contLabel(root.info) }
+            InfoPair { label: "Device KV"; value: Model.ctxDeviceLabel(root.info) }
 
-            // Stacked L1/L2/L3 restored-tokens bar.
+            // Device KV occupancy bar (paged cache, from /telemetry).
             Item {
               width: parent.width
               implicitHeight: Style.space(10)
@@ -411,36 +446,73 @@ Panel {
                 color: Util.alpha(root.fg, 0.12)
               }
 
-              Row {
-                anchors.fill: parent
-
-                Rectangle {
-                  height: parent.height
-                  radius: 2
-                  width: Math.max(0, parent.width * root.cacheParts.l1)
-                  color: "#adda78"
-                }
-                Rectangle {
-                  height: parent.height
-                  radius: 2
-                  width: Math.max(0, parent.width * root.cacheParts.l2)
-                  color: Color.accent
-                }
-                Rectangle {
-                  height: parent.height
-                  radius: 2
-                  width: Math.max(0, parent.width * root.cacheParts.l3)
-                  color: Color.muted
-                }
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.left: parent.left
+                height: parent.height
+                width: Math.max(0, parent.width * root.ctxFraction)
+                radius: parent.height / 2
+                color: "#adda78"
               }
             }
 
-            Row {
-              spacing: Style.space(14)
+            InfoPair { label: "Host spill"; value: Model.ctxHostLabel(root.info) }
+            InfoPair { label: "State"; value: Model.ctxStateLabel(root.info) }
+            InfoPair { label: "Pressure"; value: Model.ctxPressureLabel(root.info) }
+          }
 
-              CacheChip { tint: "#adda78"; label: "L1 " + Model.human(root.cacheParts.rawL1) }
-              CacheChip { tint: Color.accent; label: "L2 " + Model.human(root.cacheParts.rawL2) }
-              CacheChip { tint: Color.muted; label: "L3 " + Model.human(root.cacheParts.rawL3) }
+          // ---------- Spec decode ----------
+          PanelSeparator {
+            foreground: root.fg
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "SPEC DECODE"
+              foreground: root.fg
+              fontFamily: root.ff
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              wrapMode: Text.Wrap
+              color: root.fg
+              opacity: 0.65
+              font.family: root.ff
+              font.pixelSize: Style.font.bodySmall
+              text: "DFlash2 K7 speculative decoding (pinned companion weights). Off falls back to MTP3 (3-draft), which fits the full 262K context."
+            }
+
+            Text {
+              visible: Model.specImpact(root.info) !== ""
+              textFormat: Text.PlainText
+              width: parent.width
+              wrapMode: Text.Wrap
+              color: root.fg
+              font.family: root.ff
+              font.pixelSize: Style.font.body
+              text: Model.specImpact(root.info)
+            }
+
+            Toggle {
+              id: specToggle
+              width: parent.width
+              label: "Enable DFlash2"
+              checked: root.specOn
+              foreground: root.fg
+              fontFamily: root.ff
+              hasCursor: root.cursorActive && root.focusSection === "spec"
+              onHovered: function(on) {
+                if (on) {
+                  root.cursorActive = true
+                  root.focusSection = "spec"
+                }
+              }
+              onClicked: root.toggleSpec()
             }
           }
 
@@ -467,7 +539,18 @@ Panel {
               opacity: 0.65
               font.family: root.ff
               font.pixelSize: Style.font.bodySmall
-              text: "Multimodal input: the model accepts images and video frames. Changing this restarts the model if it is running."
+              text: "Multimodal input: the model accepts images and video frames."
+            }
+
+            Text {
+              visible: Model.visionImpact(root.info) !== ""
+              textFormat: Text.PlainText
+              width: parent.width
+              wrapMode: Text.Wrap
+              color: root.fg
+              font.family: root.ff
+              font.pixelSize: Style.font.body
+              text: Model.visionImpact(root.info)
             }
 
             Toggle {
@@ -493,27 +576,55 @@ Panel {
             foreground: root.fg
           }
 
-          Button {
-            id: logsBtn
+          Row {
             width: parent.width
-            // Explicit height: guards against the button collapsing when its
-            // implicit height resolves late (icon-glyph metrics), which would
-            // drop the whole actions section out of the column's implicit
-            // height and clip it off the panel.
-            height: implicitHeight > 0
-              ? implicitHeight
-              : Style.spacing.controlHeight + Style.spacing.controlPaddingY * 2
-            iconText: "\u{F00C5}"  // console
-            text: "Logs"
-            foreground: root.fg
-            fontFamily: root.ff
-            bordered: true
-            hasCursor: root.cursorActive && root.focusSection === "actions"
-            onClicked: root.openLogs()
-            onHovered: function(h) {
-              if (h) {
-                root.cursorActive = true
-                root.focusSection = "actions"
+            spacing: Style.space(8)
+
+            Button {
+              id: dashBtn
+              width: (parent.width - Style.space(8)) / 2
+              // Explicit height: guards against the button collapsing when its
+              // implicit height resolves late (icon-glyph metrics), which would
+              // drop the whole actions section out of the column's implicit
+              // height and clip it off the panel.
+              height: implicitHeight > 0
+                ? implicitHeight
+                : Style.spacing.controlHeight + Style.spacing.controlPaddingY * 2
+              iconText: "\u{F056E}"  // view dashboard
+              text: "Dashboard"
+              foreground: root.fg
+              fontFamily: root.ff
+              bordered: true
+              hasCursor: root.cursorActive && root.focusSection === "actions" && root.actionIndex === 0
+              onClicked: root.openDashboard()
+              onHovered: function(h) {
+                if (h) {
+                  root.cursorActive = true
+                  root.focusSection = "actions"
+                  root.actionIndex = 0
+                }
+              }
+            }
+
+            Button {
+              id: logsBtn
+              width: (parent.width - Style.space(8)) / 2
+              height: implicitHeight > 0
+                ? implicitHeight
+                : Style.spacing.controlHeight + Style.spacing.controlPaddingY * 2
+              iconText: "\u{F00C5}"  // console
+              text: "Logs"
+              foreground: root.fg
+              fontFamily: root.ff
+              bordered: true
+              hasCursor: root.cursorActive && root.focusSection === "actions" && root.actionIndex === 1
+              onClicked: root.openLogs()
+              onHovered: function(h) {
+                if (h) {
+                  root.cursorActive = true
+                  root.focusSection = "actions"
+                  root.actionIndex = 1
+                }
               }
             }
           }
@@ -641,28 +752,4 @@ Panel {
   }
 
   // Tiny colored bullet + label for the cache-tier legend.
-  component CacheChip: Row {
-    id: cacheChip
-    property string label: ""
-    property color tint: root.fg
-    spacing: Style.space(5)
-
-    Rectangle {
-      width: Style.space(7)
-      height: Style.space(7)
-      radius: 2
-      color: cacheChip.tint
-      anchors.verticalCenter: parent.verticalCenter
-    }
-
-    Text {
-      textFormat: Text.PlainText
-      text: cacheChip.label
-      color: root.fg
-      opacity: 0.7
-      font.family: root.ff
-      font.pixelSize: Style.font.caption
-      anchors.verticalCenter: parent.verticalCenter
-    }
-  }
 }

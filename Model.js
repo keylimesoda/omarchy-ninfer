@@ -104,14 +104,60 @@ function visionLabel(info) {
   return info && info.vision === "on" ? "On" : "Off"
 }
 
-// "RTX 4090 · 21.4/24.0 GB"
+// Spec-decode mode from the info feed: "dflash2" | "mtp" (unknown reads mtp).
+function specMode(info) {
+  return info && info.spec === "dflash2" ? "dflash2" : "mtp"
+}
+
+// Context ceilings per (spec, vision) combination. Must stay in sync with the
+// spec_context() matrix in the bundled ninfer-qwen helper — the launch line
+// bakes the matching --max-context into the container.
+var CONTEXT_MATRIX = {
+  "dflash2:off": 176128,
+  "dflash2:on": 139264,
+  "mtp:off": 262144,
+  "mtp:on": 262144
+}
+
+// Ceiling the launch line will use for a given (spec, visionOn) combo.
+function comboContext(spec, visionOn) {
+  var c = CONTEXT_MATRIX[spec + ":" + (visionOn ? "on" : "off")]
+  return c || 0
+}
+
+// One-line context impact of flipping a switch, e.g.
+// "context 176,128 -> 139,264 tok" (empty string when the context is
+// unchanged by the flip, e.g. vision on top of MTP).
+function visionImpact(info) {
+  var spec = specMode(info)
+  var now = !!(info && info.vision === "on")
+  var before = comboContext(spec, now)
+  var after = comboContext(spec, !now)
+  if (before === after) return ""
+  var verb = now ? "Disabling frees" : "Enabling costs"
+  var tok = before - after
+  if (tok < 0) tok = -tok
+  return verb + " " + group(tok) + " tok of context"
+}
+
+function specImpact(info) {
+  var spec = specMode(info)
+  var now = spec === "dflash2"
+  var visionOn = !!(info && info.vision === "on")
+  var before = comboContext(spec, visionOn)
+  var after = comboContext(now ? "mtp" : "dflash2", visionOn)
+  if (before === after) return ""
+  return "context " + group(before) + " -> " + group(after) + " tok"
+}
+
+// "RTX 4090 · 21.4/24.0 GB" (feed reports VRAM in bytes)
 function gpuLabel(info) {
   if (!info) return "—"
   var name = (info.gpu_name && info.gpu_name !== "GPU") ? info.gpu_name : "GPU"
   var used = Number(info.vram_used) || 0
   var total = Number(info.vram_total) || 0
   if (used > 0 && total > 0)
-    return name + " · " + trim1(used / 1024) + "/" + trim1(total / 1024) + " GB"
+    return name + " · " + trim1(used / 1073741824) + "/" + trim1(total / 1073741824) + " GB"
   return name
 }
 
@@ -147,29 +193,57 @@ function generatedLabel(info) {
   return human(n) + " tokens"
 }
 
-function contLabel(info) {
-  var n = Number((info && info.cont_restored_tokens) || 0)
-  if (n <= 0) return "None yet"
-  return human(n) + " tokens"
+// Context-cache occupancy from the hybrid runtime's /telemetry: device KV
+// tokens served from the paged cache versus configured capacity.
+function ctxDeviceLabel(info) {
+  var used = Number((info && info.ctx_device_tokens) || 0)
+  var cap = Number((info && info.ctx_device_capacity) || 0)
+  if (used <= 0 && cap <= 0) return "—"
+  if (cap <= 0) return human(used) + " tok"
+  return human(used) + " / " + human(cap) + " tok"
 }
 
-// L1/L2/L3 restored-token fractions for the stacked cache bar.
-// Fractions collapse to zero when nothing has been restored.
-function cacheParts(info) {
-  var l1 = Number((info && info.cont_l1_tokens) || 0)
-  var l2 = Number((info && info.cont_l2_tokens) || 0)
-  var l3 = Number((info && info.cont_l3_tokens) || 0)
-  var total = l1 + l2 + l3
-  var base = total > 0 ? total : 1
-  return {
-    l1: l1 / base,
-    l2: l2 / base,
-    l3: l3 / base,
-    total: total,
-    rawL1: l1,
-    rawL2: l2,
-    rawL3: l3
-  }
+// Fraction (0..1) of device KV capacity currently occupied; 0 when unknown.
+function ctxDeviceFraction(info) {
+  var used = Number((info && info.ctx_device_tokens) || 0)
+  var cap = Number((info && info.ctx_device_capacity) || 0)
+  if (cap <= 0) return 0
+  return Math.max(0, Math.min(1, used / cap))
+}
+
+// Host KV spill: occupied bytes versus host capacity, in GiB.
+function ctxHostLabel(info) {
+  var used = Number((info && info.ctx_host_bytes) || 0)
+  var cap = Number((info && info.ctx_host_capacity) || 0)
+  if (cap <= 0 && used <= 0) return "—"
+  return trim1(used / 1073741824) + " / " + trim1(cap / 1073741824) + " GiB"
+}
+
+// State-slot occupancy, e.g. "dev 2 · host 8/8".
+function ctxStateLabel(info) {
+  var dev = Number((info && info.ctx_state_device) || 0)
+  var host = Number((info && info.ctx_state_host) || 0)
+  var hostCap = Number((info && info.ctx_state_host_capacity) || 0)
+  if (dev <= 0 && host <= 0) return "—"
+  var s = "dev " + dev
+  if (hostCap > 0) s += " · host " + host + "/" + hostCap
+  else if (host > 0) s += " · host " + host
+  return s
+}
+
+// Pressure summary: "Stable" when nothing degraded, otherwise the counts.
+function ctxPressureLabel(info) {
+  var dropped = Number((info && info.ctx_dropped) || 0)
+  var degraded = Number((info && info.ctx_degraded) || 0)
+  var evicted = Number((info && info.ctx_evicted) || 0)
+  var spill = Number((info && info.ctx_spill) || 0)
+  if (dropped + degraded + evicted + spill === 0) return "Stable"
+  var parts = []
+  if (degraded > 0) parts.push(human(degraded) + " degraded")
+  if (dropped > 0) parts.push(human(dropped) + " dropped")
+  if (evicted > 0) parts.push(human(evicted) + " evicted")
+  if (spill > 0) parts.push(human(spill) + " spilled")
+  return parts.join(" · ")
 }
 
 if (typeof module !== "undefined") {
@@ -185,12 +259,19 @@ if (typeof module !== "undefined") {
     kvLabel: kvLabel,
     specLabel: specLabel,
     visionLabel: visionLabel,
+    specMode: specMode,
+    comboContext: comboContext,
+    visionImpact: visionImpact,
+    specImpact: specImpact,
     gpuLabel: gpuLabel,
     prefixHitLabel: prefixHitLabel,
     specAcceptLabel: specAcceptLabel,
     requestsLabel: requestsLabel,
     generatedLabel: generatedLabel,
-    contLabel: contLabel,
-    cacheParts: cacheParts
+    ctxDeviceLabel: ctxDeviceLabel,
+    ctxDeviceFraction: ctxDeviceFraction,
+    ctxHostLabel: ctxHostLabel,
+    ctxStateLabel: ctxStateLabel,
+    ctxPressureLabel: ctxPressureLabel
   }
 }

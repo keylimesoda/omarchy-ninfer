@@ -3,25 +3,45 @@ set -uo pipefail
 
 container=ninfer-qwen
 api=http://127.0.0.1:8080
+web=http://127.0.0.1:8080/
 action=${1:-status}
 
-# Telemetry assumes the HTTP API emitted by tensorninja/ninfer-4090
-# (github.com/tensorninja/ninfer-4090): the OpenAI-compatible /v1/models plus
-# the llama.cpp-compatible /metrics and that runtime's ninfer_* prefix,
-# draft, and continuation-cache counters. Other ninfer forks or upstream may
-# not emit those counters, in which case the matching panel fields read zero.
+# Runtime: keylimesoda/ninfer-4090-lin-hybrid (github.com/keylimesoda/
+# ninfer-4090-lin-hybrid) — the sm_89/Linux port of NInfer. Telemetry below
+# assumes that runtime's HTTP API: the OpenAI-compatible /v1/models, the
+# llama.cpp-compatible /metrics plus the ninfer_* counters, and the /telemetry
+# JSON (context-cache state, scheduler, NVML GPU block). Other ninfer builds
+# (e.g. tensorninja/ninfer-4090) expose the same /metrics names but not the
+# /telemetry context-cache schema, so those panel sections read empty.
 
 # Serving configuration, kept in sync with the launch arguments below.
 model_id_fallback=qwen3.8-27b
 model_name_fallback="Qwen 3.8 27B"
-context_window_fallback=262144
 kv_dtype=rk4v4-e8
-spec=mtp
-draft_tokens=3
-image=ninfer-4090:sm89
+image=ninfer-4090:hybrid
+# Context ceiling per (spec, vision) combination, baked into the launch line
+# (the runtime budgets VRAM exactly, so each combo has a fixed ceiling):
+#   dflash2, vision off  -> 176128  (production profile, ~134 MiB slack)
+#   dflash2, vision on   -> 139264  (budget estimate: vision costs ~0.6 GiB
+#                                    ~= 36K tokens of E8 KV; untested, kept
+#                                    on the safe side)
+#   mtp,     vision off  -> 262144  (full native context, 1.37 GiB slack)
+#   mtp,     vision on   -> 262144  (8K scratchpad default, 780 MiB slack)
+spec_context() {
+  # $1 = spec mode (dflash2|mtp), $2 = vision (on|off)
+  if [[ "$1" == mtp ]]; then printf '262144\n'
+  elif [[ "$2" == on ]]; then printf '139264\n'
+  else printf '176128\n'; fi
+}
+# The model artifact is bind-mounted into the container (read-only). The
+# pinned v2 artifact carries Text+MTP+Vision+DFlash2, so every spec/vision
+# combo runs from this one file.
+model_artifact="${NINFER_MODEL_ARTIFACT:-$HOME/Work/ninfer-artifacts/qwen3_8_27b_dflash2.ninfer}"
 # Vision is opt-in: the persisted flag decides whether start_model passes --vision.
 vision_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ninfer-qwen"
 vision_file="$vision_dir/vision"
+# Spec-decode mode: dflash2 (default) or mtp (MTP3 fallback).
+spec_file="$vision_dir/spec"
 
 read_vision() {
   if [[ -f "$vision_file" ]] && grep -qx on "$vision_file" 2>/dev/null; then
@@ -36,6 +56,19 @@ set_vision() {
   printf '%s\n' "$1" >"$vision_file"
 }
 
+read_spec() {
+  if [[ -f "$spec_file" ]] && grep -qx mtp "$spec_file" 2>/dev/null; then
+    printf 'mtp\n'
+  else
+    printf 'dflash2\n'
+  fi
+}
+
+set_spec() {
+  mkdir -p "$vision_dir"
+  printf '%s\n' "$1" >"$spec_file"
+}
+
 exists() {
   docker container inspect "$container" >/dev/null 2>&1
 }
@@ -47,30 +80,37 @@ running() {
 start_model() {
   local vision_args=()
   [[ "$(read_vision)" == on ]] && vision_args=(--vision)
+  local spec_mode spec_args ctx
+  spec_mode=$(read_spec)
+  if [[ "$spec_mode" == mtp ]]; then
+    spec_args=(--spec mtp --draft-tokens 3 --lm-head-draft)
+  else
+    spec_args=(--spec dflash2 --draft-tokens 7 --lm-head-draft)
+  fi
+  ctx=$(spec_context "$spec_mode" "$(read_vision)")
   if exists; then
     if ! running; then docker start "$container" >/dev/null; fi
   else
+    [[ -f "$model_artifact" ]] || {
+      printf 'error: model artifact not found: %s\n' "$model_artifact" >&2
+      return 1
+    }
     docker run --detach --restart unless-stopped --gpus all --name "$container" \
       --publish 127.0.0.1:8080:8080 \
+      --mount "type=bind,src=$model_artifact,dst=/models/qwen3_8_27b.ninfer,ro" \
       --volume ninfer-continuations:/var/cache/ninfer \
-      ninfer-4090:sm89 \
-      ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
+      "$image" \
+      ninfer-serve /models/qwen3_8_27b.ninfer \
       --model-id qwen3.8-27b \
       --host 0.0.0.0 --port 8080 \
-      --max-context 262144 --kv-capacity 262144 \
+      --max-context "$ctx" --kv-capacity "$ctx" \
       --max-concurrency 1 --max-pending-requests 16 \
       --pending-timeout-ms 600000 --prefill-chunk 1024 \
-      --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 3 --lm-head-draft \
-      --prefix-checkpoint-policy rolling-tool \
-      --continuation-cache l1-l2-l3 \
-      --continuation-cache-dir /var/cache/ninfer \
-      --continuation-cache-namespace local \
-      --continuation-cache-l1-mib 768 \
-      --continuation-cache-l2-mib 16384 \
-      --continuation-cache-l3-mib 49152 \
-      --continuation-cache-filesystem-reserve-mib 4096 \
+      --kv-dtype rk4v4-e8 "${spec_args[@]}" \
       --preserve-thinking \
-      --no-cuda-graph "${vision_args[@]}" >/dev/null
+      --request-log-jsonl /var/cache/ninfer/request-log.jsonl \
+      --web-dir /opt/ninfer/web \
+      "${vision_args[@]}" >/dev/null
   fi
 }
 
@@ -94,6 +134,20 @@ vision_cmd() {
     if [[ "$(read_vision)" == on ]]; then want=off; else want=on; fi
   fi
   set_vision "$want"
+  if exists && running; then
+    recreate_model
+    printf 'restarting\n'
+  else
+    printf '%s\n' "$want"
+  fi
+}
+
+spec_cmd() {
+  local want="${1:-toggle}"
+  if [[ "$want" != on && "$want" != off ]]; then
+    if [[ "$(read_spec)" == mtp ]]; then want=on; else want=off; fi
+  fi
+  set_spec "$([[ "$want" == on ]] && printf dflash2 || printf mtp)"
   if exists && running; then
     recreate_model
     printf 'restarting\n'
@@ -129,6 +183,67 @@ metric() {
   printf '%s\n' "$1" | awk -v k="$2" '$1 == k { v = $2 } END { if (v != "") print v }'
 }
 
+# telemetry TELEMETRY_JSON -> shell lines for the context-cache section.
+# The hybrid runtime reports the new paged-KV context cache: device page
+# groups (capacity => tokens), host spill bytes, state slots, and a pressure
+# block. Emits nothing when /telemetry is unavailable (e.g. model still
+# loading), which the panel renders as dashes.
+_cache_py=$(cat <<'PYEOF'
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+c = d.get("cache") or {}
+p = c.get("pressure") or {}
+groups = c.get("kv_capacity_page_groups") or 0
+occupied = c.get("device_main_kv_occupied_pages") or 0
+capacity = c.get("kv_capacity") or 0
+if groups:
+    print(f"ctx_device_tokens={int(occupied * capacity / groups)}")
+    print(f"ctx_device_capacity={capacity}")
+print(f"ctx_host_bytes={c.get('host_kv_occupied_bytes', 0)}")
+print(f"ctx_host_capacity={c.get('host_kv_capacity_bytes', 0)}")
+print(f"ctx_state_device={c.get('device_state_occupied_slots', 0)}")
+print(f"ctx_state_host={c.get('host_state_occupied_slots', 0)}")
+print(f"ctx_state_host_capacity={c.get('host_state_capacity_slots', 0)}")
+print(f"ctx_dropped={p.get('checkpoints_dropped', 0)}")
+print(f"ctx_degraded={p.get('private_owners_degraded', 0) + p.get('shared_owners_degraded', 0)}")
+print(f"ctx_evicted={p.get('private_owners_evicted', 0) + p.get('shared_owners_evicted', 0)}")
+print(f"ctx_spill={p.get('spill_pages', 0)}")
+PYEOF
+)
+
+telemetry_cache_lines() {
+  python3 -c "$_cache_py" <<<"$1" 2>/dev/null || true
+}
+
+# telemetry TELEMETRY_JSON -> shell lines for the GPU block (NVML via the
+# runtime). Used in preference to nvidia-smi when available.
+_gpu_py=$(cat <<'PYEOF'
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+g = d.get("gpu") or {}
+if not g.get("available"):
+    sys.exit(0)
+name = g.get("name", "")
+for prefix in ("NVIDIA GeForce ", "NVIDIA "):
+    if name.startswith(prefix):
+        name = name[len(prefix):]
+print(f"gpu_name={name or 'GPU'}")
+print(f"vram_used={g.get('memory_used_bytes', 0)}")
+print(f"vram_total={g.get('memory_total_bytes', 0)}")
+print(f"power_watts={g.get('power_watts', 0)}")
+PYEOF
+)
+
+telemetry_gpu_lines() {
+  python3 -c "$_gpu_py" <<<"$1" 2>/dev/null || true
+}
+
 info() {
   local state
   state=$(status)
@@ -155,27 +270,48 @@ except Exception:
   fi
   [[ -n "$vision" ]] || vision=$(read_vision)
 
+  local spec_mode
+  spec_mode=$(read_spec)
+
   printf 'model_id=%s\n' "${model_id:-$model_id_fallback}"
   printf 'model_name=%s\n' "$model_name_fallback"
-  printf 'context_window=%s\n' "${model_ctx:-$context_window_fallback}"
+  printf 'context_window=%s\n' "${model_ctx:-$(spec_context "$spec_mode" "$vision")}"
   printf 'kv_dtype=%s\n' "$kv_dtype"
-  printf 'spec=%s\n' "$spec"
-  printf 'draft_tokens=%s\n' "$draft_tokens"
+  printf 'spec=%s\n' "$spec_mode"
+  if [[ "$spec_mode" == mtp ]]; then printf 'draft_tokens=3\n'; else printf 'draft_tokens=7\n'; fi
   printf 'vision=%s\n' "$vision"
   printf 'endpoint=127.0.0.1:8080\n'
+  printf 'web=%s\n' "$web"
   printf 'image=%s\n' "$image"
 
-  # GPU facts; degrades gracefully when nvidia-smi is unavailable.
-  local gpu_line= gname= gused= gtotal= gpower=
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    gpu_line=$(nvidia-smi --query-gpu=name,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 || true)
+  # GPU facts from the runtime's /telemetry NVML block, with nvidia-smi as a
+  # fallback (e.g. while the model is still loading and /telemetry is quiet).
+  local gpu_text= gname= gused= gtotal= gpower=
+  if [[ "$state" == "ready" ]]; then
+    gpu_text=$(curl -s --max-time 5 "$api/telemetry" 2>/dev/null || true)
+    while IFS='=' read -r k v; do
+      case "$k" in
+        gpu_name) gname=$v ;;
+        vram_used) gused=$v ;;
+        vram_total) gtotal=$v ;;
+        power_watts) gpower=$v ;;
+      esac
+    done < <(telemetry_gpu_lines "$gpu_text")
   fi
-  # nvidia-smi CSV puts a space after each comma; trim fields afterwards.
-if [[ -n "$gpu_line" && "$gpu_line" =~ ^[^,]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9.]+$ ]]; then
-    IFS=',' read -r gname gused gtotal gpower <<<"$gpu_line"
-    gused=${gused// /}; gtotal=${gtotal// /}; gpower=${gpower// /}
-    gname=${gname#NVIDIA }
-    gname=${gname#GeForce }
+  if [[ -z "${gname:-}" && "$(command -v nvidia-smi >/dev/null 2>&1 && printf y)" == "y" ]]; then
+    local gpu_line
+    gpu_line=$(nvidia-smi --query-gpu=name,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 || true)
+    # nvidia-smi CSV puts a space after each comma; trim fields afterwards.
+    if [[ -n "$gpu_line" && "$gpu_line" =~ ^[^,]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9.]+$ ]]; then
+      IFS=',' read -r gname gused gtotal gpower <<<"$gpu_line"
+      gused=${gused// /}; gtotal=${gtotal// /}; gpower=${gpower// /}
+      gname=${gname#NVIDIA }
+      gname=${gname#GeForce }
+      # nvidia-smi reports MiB; the panel treats the value as bytes-ish —
+      # scale so both sources agree.
+      gused=$((gused * 1024 * 1024))
+      gtotal=$((gtotal * 1024 * 1024))
+    fi
   fi
   printf 'gpu_name=%s\n' "${gname:-GPU}"
   printf 'vram_used=%s\n' "${gused:-0}"
@@ -203,10 +339,13 @@ if [[ -n "$gpu_line" && "$gpu_line" =~ ^[^,]+,[[:space:]]*[0-9]+,[[:space:]]*[0-
       printf 'prefix_hit_tokens=%s\n'    "$(metric "$metrics" ninfer:prefix_cache_hit_tokens_total)"
       printf 'draft_total=%s\n'          "$(metric "$metrics" ninfer:draft_tokens_total)"
       printf 'draft_accepted=%s\n'       "$(metric "$metrics" ninfer:draft_accepted_tokens_total)"
-      printf 'cont_restored_tokens=%s\n' "$(metric "$metrics" ninfer:continuation_restored_tokens_total)"
-      printf 'cont_l1_tokens=%s\n'       "$(metric "$metrics" ninfer:continuation_l1_restored_tokens_total)"
-      printf 'cont_l2_tokens=%s\n'       "$(metric "$metrics" ninfer:continuation_l2_restored_tokens_total)"
-      printf 'cont_l3_tokens=%s\n'       "$(metric "$metrics" ninfer:continuation_l3_restored_tokens_total)"
+
+      # Context-cache state from /telemetry (the hybrid runtime's paged-KV
+      # cache system; replaces the old L1/L2/L3 continuation-cache counters).
+      if [[ -z "$gpu_text" ]]; then
+        gpu_text=$(curl -s --max-time 5 "$api/telemetry" 2>/dev/null || true)
+      fi
+      telemetry_cache_lines "$gpu_text"
     fi
   fi
 }
@@ -238,8 +377,11 @@ case "$action" in
   vision)
     vision_cmd "${2:-toggle}"
     ;;
+  spec)
+    spec_cmd "${2:-toggle}"
+    ;;
   *)
-    printf 'Usage: ninfer-qwen {status|info|on|off|toggle|vision [on|off|toggle]}\n' >&2
+    printf 'Usage: ninfer-qwen {status|info|on|off|toggle|vision [on|off|toggle]|spec [on|off|toggle]}\n' >&2
     exit 2
     ;;
 esac
